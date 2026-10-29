@@ -104,10 +104,32 @@ def validate(question, raw):
     if not isinstance(data, dict) or any(f not in data for f in FIELDS):
         return None, "a required field is missing"
 
-    # TODO 2: add the other three rules from your Lab 3 sheet. Return (None, "reason") when one fails.
-    #   Rule 2: answer_found is true only when policy_section is filled.
-    #   Rule 3: if the question holds a word from SENSITIVE, force data["needs_human"] to True.
-    #   Rule 4: numbers in the answer must appear in the cited section (or in the question).
+
+    # Rule 2: answer_found is true only when policy_section is filled.
+    if data["answer_found"] and not section:
+        return None, "answer_found is true but policy_section is empty"
+ 
+    # Rule 3: sensitive topics always go to a human.
+    q = question.lower()
+    if any(word in q for word in SENSITIVE):
+        data["needs_human"] = True
+        if not str(data["escalation_reason"] or "").strip():
+            data["escalation_reason"] = "Sensitive topic: needs a person in HR."
+ 
+    # Rule 4: numbers in the answer must appear in the cited section (or in the question).
+    if data["answer_found"]:
+        cited = [s for s in re.findall(r"\d+\.\d+", section) if s in POLICY]
+        if not cited:
+            return None, "the cited policy section does not exist"
+        allowed = set(re.findall(r"\d+", q))
+        for sid in cited:
+            allowed |= set(re.findall(r"\d+", POLICY[sid]))
+        # Take out section references like "1.1" so they are not counted as numbers.
+        answer_text = re.sub(r"\d+\.\d+", "", str(data["answer"]))
+        extra = set(re.findall(r"\d+", answer_text)) - allowed
+        if extra:
+            return None, "numbers in the answer do not match the policy: " + ", ".join(sorted(extra))
+ 
     return data, None
 
 
