@@ -34,13 +34,13 @@ POLICY = {
 
 # Step 2 of the workflow pattern (prepare context): pick only the section(s) that apply.
 KEYWORDS = {
-    "1.1": ["annual leave"],
+    "1.1": ["annual leave", "vacation", "holiday", "leave days", "days of leave"],
     "1.2": ["carry", "lapse"],
-    "1.3": ["notice", "days off", "take leave", "time off"],
+    "1.3": ["notice", "days off", "take leave", "time off", "apply for leave", "book leave"],
     "2.1": ["sick", "doctor", "medical"],
-    "3.1": ["working hours", "start time", "grace"],
+    "3.1": ["working hours", "office hours", "start time", "grace", "what time", "late"],
     "3.2": ["work from home", "remote", "wfh"],
-    "4.1": ["insurance"],
+    "4.1": ["insurance", "health cover", "spouse", "children", "covered"],
     "5.1": ["salary", "pay"],
 }
 
@@ -101,7 +101,10 @@ def clean(raw):
     """Remove code fences if the model wrapped its JSON in them."""
     text = (raw or "").strip()
     text = re.sub(r"^```(?:json)?", "", text).strip()
-    return re.sub(r"```$", "", text).strip()
+    text = re.sub(r"```$", "", text).strip()
+    # FIX: if the model added chatter around the JSON, keep only the {...} part.
+    start, end = text.find("{"), text.rfind("}")
+    return text[start:end + 1] if start != -1 and end > start else text
 
 
 def validate(question, raw):
@@ -115,8 +118,12 @@ def validate(question, raw):
         return None, "a required field is missing"
 
     # Rule 2: answer_found is true only when policy_section is filled
-    section = str(data["policy_section"] or "")
-    if data["answer_found"] is True and not section:
+    # FIX: pull "1.1" out of "Section 1.1" / "1.1." etc. so a harmless wording difference
+    # does not count as a wrong section. "none", "N/A" or empty becomes "".
+    match = re.search(r"\d+\.\d+", str(data["policy_section"] or ""))
+    section = match.group(0) if match else ""
+    found = data["answer_found"] is True or str(data["answer_found"]).lower() == "true"
+    if found and not section:
         return None, "answer_found is true but policy_section is empty"
 
     # Rule 3: sensitive topics always need a person
@@ -126,12 +133,18 @@ def validate(question, raw):
             data["escalation_reason"] = "Sensitive topic"
 
     # Rule 4: numbers in the answer must match the cited section (or the employee's own question)
-    if section:
+    # FIX: only check when the model says it found an answer. When it says "not found" it often
+    # writes "none" in policy_section, which used to be rejected and hid its escalation_reason.
+    if found:
         if section not in POLICY:
             return None, "the cited section does not exist"
+        # FIX: the answer usually says "(section 1.1)". Take the section number out before
+        # comparing, otherwise the 1 and 1 in "1.1" look like numbers the policy never mentions.
+        answer_text = re.sub(r"\d+\.\d+", "", str(data["answer"]))
         allowed = set(re.findall(r"\d+", POLICY[section])) | set(re.findall(r"\d+", question))
-        if not set(re.findall(r"\d+", str(data["answer"]))) <= allowed:
+        if not set(re.findall(r"\d+", answer_text)) <= allowed:
             return None, "a number in the answer does not match the cited section"
+    data["policy_section"] = section
     return data, None
 
 
