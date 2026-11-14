@@ -34,13 +34,13 @@ POLICY = {
 
 # Step 2 of the workflow pattern (prepare context): pick only the section(s) that apply.
 KEYWORDS = {
-    "1.1": ["annual leave"],
+    "1.1": ["annual leave", "vacation", "holiday", "leave days", "days of leave"],
     "1.2": ["carry", "lapse"],
-    "1.3": ["notice", "days off", "take leave", "time off"],
+    "1.3": ["notice", "days off", "take leave", "time off", "apply for leave", "book leave"],
     "2.1": ["sick", "doctor", "medical"],
-    "3.1": ["working hours", "start time", "grace"],
+    "3.1": ["working hours", "office hours", "start time", "grace", "what time", "late"],
     "3.2": ["work from home", "remote", "wfh"],
-    "4.1": ["insurance"],
+    "4.1": ["insurance", "health cover", "spouse", "children", "covered"],
     "5.1": ["salary", "pay"],
 }
 
@@ -51,26 +51,36 @@ def pick_sections(question):
 
 
 # ---------------------------------------------------------------- TODO 1: the reusable prompt
-PROMPT_TEMPLATE = """You are an HR assistant. you are supposed to asnwer the questions from {{question}} and your response should be from {{policy_text}} 
-Answer only from the approved documents provided {{policy_version}}
+PROMPT_TEMPLATE = """You are the HR assistant for Meridian Logistics.
+
+SOURCES
+Answer only from the policy text below. Policy version: {{policy_version}}.
+
+POLICY TEXT
+{{policy_text}}
+
+EMPLOYEE QUESTION
+{{question}}
+
 HOW TO ANSWER
 1. Find the section that answers the question.
 2. Answer in plain language in three sentences or fewer and give the section number.
-3. If the documents do not clearly answer the question, say you could not find it and set
-needs_human to true.
+3. If the policy text does not clearly answer the question, say you could not find it and set
+   needs_human to true.
+
 ALWAYS ESCALATE (needs_human = true)
 - Complaints about managers or colleagues, harassment, pay disputes, termination, medical details.
 - Any request for another person's data.
 - Anything that needs a system lookup you do not have, such as a leave balance.
+
 NEVER
-- Guess a number, date or rule that is not in the documents.
+- Guess a number, date or rule that is not in the policy text.
 - Repeat personal identifiers back to the user.
+
 OUTPUT
 Return only valid JSON with these fields: answer, policy_section, answer_found, needs_human,
-escalation_reason."""
-# TODO 1: rewrite PROMPT_TEMPLATE using the Lab 1 instructions and these three placeholders:
-#   {{policy_version}}  {{policy_text}}  {{question}}
-# It must tell the model to answer only from the policy text and to return the five JSON fields.
+escalation_reason.
+"""
 
 
 def build_prompt(question):
@@ -91,12 +101,15 @@ def clean(raw):
     """Remove code fences if the model wrapped its JSON in them."""
     text = (raw or "").strip()
     text = re.sub(r"^```(?:json)?", "", text).strip()
-    return re.sub(r"```$", "", text).strip()
+    text = re.sub(r"```$", "", text).strip()
+    # FIX: if the model added chatter around the JSON, keep only the {...} part.
+    start, end = text.find("{"), text.rfind("}")
+    return text[start:end + 1] if start != -1 and end > start else text
 
 
 def validate(question, raw):
     """Return (data, problem). problem is None when every rule passes."""
-    # Rule 1 is done for you: valid JSON with all five fields.
+    # Rule 1: valid JSON with all five fields
     try:
         data = json.loads(clean(raw))
     except (json.JSONDecodeError, TypeError):
@@ -104,39 +117,45 @@ def validate(question, raw):
     if not isinstance(data, dict) or any(f not in data for f in FIELDS):
         return None, "a required field is missing"
 
-
-    # Rule 2: answer_found is true only when policy_section is filled.
-    if data["answer_found"] and not section:
+    # Rule 2: answer_found is true only when policy_section is filled
+    # FIX: pull "1.1" out of "Section 1.1" / "1.1." etc. so a harmless wording difference
+    # does not count as a wrong section. "none", "N/A" or empty becomes "".
+    match = re.search(r"\d+\.\d+", str(data["policy_section"] or ""))
+    section = match.group(0) if match else ""
+    found = data["answer_found"] is True or str(data["answer_found"]).lower() == "true"
+    if found and not section:
         return None, "answer_found is true but policy_section is empty"
- 
-    # Rule 3: sensitive topics always go to a human.
-    q = question.lower()
-    if any(word in q for word in SENSITIVE):
+
+    # Rule 3: sensitive topics always need a person
+    if any(word in question.lower() for word in SENSITIVE):
         data["needs_human"] = True
-        if not str(data["escalation_reason"] or "").strip():
-            data["escalation_reason"] = "Sensitive topic: needs a person in HR."
- 
-    # Rule 4: numbers in the answer must appear in the cited section (or in the question).
-    if data["answer_found"]:
-        cited = [s for s in re.findall(r"\d+\.\d+", section) if s in POLICY]
-        if not cited:
-            return None, "the cited policy section does not exist"
-        allowed = set(re.findall(r"\d+", q))
-        for sid in cited:
-            allowed |= set(re.findall(r"\d+", POLICY[sid]))
-        # Take out section references like "1.1" so they are not counted as numbers.
+        if not data["escalation_reason"]:
+            data["escalation_reason"] = "Sensitive topic"
+
+    # Rule 4: numbers in the answer must match the cited section (or the employee's own question)
+    # FIX: only check when the model says it found an answer. When it says "not found" it often
+    # writes "none" in policy_section, which used to be rejected and hid its escalation_reason.
+    if found:
+        if section not in POLICY:
+            return None, "the cited section does not exist"
+        # FIX: the answer usually says "(section 1.1)". Take the section number out before
+        # comparing, otherwise the 1 and 1 in "1.1" look like numbers the policy never mentions.
         answer_text = re.sub(r"\d+\.\d+", "", str(data["answer"]))
-        extra = set(re.findall(r"\d+", answer_text)) - allowed
-        if extra:
-            return None, "numbers in the answer do not match the policy: " + ", ".join(sorted(extra))
- 
+        allowed = set(re.findall(r"\d+", POLICY[section])) | set(re.findall(r"\d+", question))
+        if not set(re.findall(r"\d+", answer_text)) <= allowed:
+            return None, "a number in the answer does not match the cited section"
+    data["policy_section"] = section
     return data, None
 
 
 # ---------------------------------------------------------------- TODO 3: the message to HR
 def hr_message(question, data, problem=None):
-    # TODO 3: write the message sent to HR. It needs the question, the reason and any section found.
-    return f"Question: {question}"
+    reason = problem or (data or {}).get("escalation_reason") or "Needs a person"
+    section = (data or {}).get("policy_section") or "none"
+    return (f"To: HR team\n"
+            f"Question: {question}\n"
+            f"Reason for escalation: {reason}\n"
+            f"Policy section found: {section}")
 
 
 # ---------------------------------------------------------------- calling the model
